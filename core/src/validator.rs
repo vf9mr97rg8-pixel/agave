@@ -1,4 +1,4 @@
-//! The `validator` module hosts all the validator microservices.
+//!The `validator` module hosts all the validator microservices.
 
 pub use solana_perf::report_target_features;
 use {
@@ -6,6 +6,7 @@ use {
         accounts_hash_verifier::AccountsHashVerifier,
         admin_rpc_post_init::AdminRpcRequestMetadataPostInit,
         banking_trace::{self, BankingTracer},
+        window_service::WindowService,
         cache_block_meta_service::{CacheBlockMetaSender, CacheBlockMetaService},
         cluster_info_vote_listener::VoteTracker,
         completed_data_sets_service::CompletedDataSetsService,
@@ -458,7 +459,6 @@ struct TransactionHistoryServices {
     cache_block_meta_sender: Option<CacheBlockMetaSender>,
     cache_block_meta_service: Option<CacheBlockMetaService>,
 }
-
 pub struct Validator {
     validator_exit: Arc<RwLock<Exit>>,
     json_rpc_service: Option<JsonRpcService>,
@@ -471,30 +471,32 @@ pub struct Validator {
     entry_notifier_service: Option<EntryNotifierService>,
     system_monitor_service: Option<SystemMonitorService>,
     sample_performance_service: Option<SamplePerformanceService>,
-    poh_timing_report_service: PohTimingReportService,
-    stats_reporter_service: StatsReporterService,
-    gossip_service: GossipService,
-    serve_repair_service: ServeRepairService,
+    poh_timing_report_service: Option<PohTimingReportService>,
+    stats_reporter_service: Option<StatsReporterService>,
+    gossip_service: Option<GossipService>,
+    serve_repair_service: Option<ServeRepairService>,
     completed_data_sets_service: Option<CompletedDataSetsService>,
     snapshot_packager_service: Option<SnapshotPackagerService>,
     poh_recorder: Arc<RwLock<PohRecorder>>,
-    poh_service: PohService,
-    tpu: Tpu,
+    poh_service: Option<PohService>,
+    tpu: Option<Tpu>,
     tvu: Tvu,
     ip_echo_server: Option<solana_net_utils::IpEchoServer>,
     pub cluster_info: Arc<ClusterInfo>,
     pub bank_forks: Arc<RwLock<BankForks>>,
     pub blockstore: Arc<Blockstore>,
     geyser_plugin_service: Option<GeyserPluginService>,
-    blockstore_metric_report_service: BlockstoreMetricReportService,
-    accounts_background_service: AccountsBackgroundService,
-    accounts_hash_verifier: AccountsHashVerifier,
+    blockstore_metric_report_service: Option<BlockstoreMetricReportService>,
+    accounts_background_service: Option<AccountsBackgroundService>,
+    accounts_hash_verifier: Option<AccountsHashVerifier>,
     turbine_quic_endpoint: Option<Endpoint>,
     turbine_quic_endpoint_runtime: Option<TokioRuntime>,
     turbine_quic_endpoint_join_handle: Option<solana_turbine::quic_endpoint::AsyncTryJoinHandle>,
     repair_quic_endpoint: Option<Endpoint>,
     repair_quic_endpoint_runtime: Option<TokioRuntime>,
     repair_quic_endpoint_join_handle: Option<repair::quic_endpoint::AsyncTryJoinHandle>,
+    window_service: Option<WindowService>,
+    tower: Option<Tower>,
 }
 
 impl Validator {
@@ -1134,15 +1136,15 @@ impl Validator {
         let stats_reporter_service =
             StatsReporterService::new(stats_reporter_receiver, exit.clone());
 
-        let gossip_service = GossipService::new(
-            &cluster_info,
-            Some(bank_forks.clone()),
-            node.sockets.gossip,
-            config.gossip_validators.clone(),
-            should_check_duplicate_instance,
-            Some(stats_reporter_sender.clone()),
-            exit.clone(),
-        );
+            let gossip_service = None;
+//            &cluster_info,
+//            Some(bank_forks.clone()),
+//            node.sockets.gossip,
+//            config.gossip_validators.clone(),
+//            should_check_duplicate_instance,
+//            Some(stats_reporter_sender.clone()),
+//            exit.clone(),
+//        );
         let serve_repair = ServeRepair::new(
             cluster_info.clone(),
             bank_forks.clone(),
@@ -1293,20 +1295,22 @@ impl Validator {
         } else {
             None
         };
-        let tower = match process_blockstore.process_to_create_tower() {
-            Ok(tower) => {
-                info!("Tower state: {:?}", tower);
-                tower
-            }
-            Err(e) => {
-                warn!(
-                    "Unable to retrieve tower: {:?} creating default tower....",
-                    e
-                );
-                Tower::default()
-            }
-        };
-        let last_vote = tower.last_vote();
+        let window_service = None;
+        let tower = None;
+        //let tower = match process_blockstore.process_to_create_tower() {
+        //    Ok(tower) => {
+        //        info!("Tower state: {:?}", tower);
+        //        tower
+        //    }
+        //    Err(e) => {
+        //        warn!(
+        //            "Unable to retrieve tower: {:?} creating default tower....",
+        //            e
+        //        );
+        //        Tower::default()
+        //    }
+        //};
+        let last_vote = tower.as_ref().map(|t: &Tower| t.last_vote());
 
         let outstanding_repair_requests =
             Arc::<RwLock<repair::repair_service::OutstandingShredRepairs>>::default();
@@ -1328,7 +1332,7 @@ impl Validator {
             ledger_signal_receiver,
             &rpc_subscriptions,
             &poh_recorder,
-            tower,
+            tower.clone().unwrap_or_default(),
             config.tower_storage.clone(),
             &leader_schedule_cache,
             exit.clone(),
@@ -1375,7 +1379,7 @@ impl Validator {
             info!("Waiting for wen_restart phase one to finish");
             match wait_for_wen_restart(WenRestartConfig {
                 wen_restart_path: config.wen_restart_proto_path.clone().unwrap(),
-                last_vote,
+                last_vote: last_vote.unwrap_or_else(|| solana_vote_program::vote_state::VoteTransaction::from(solana_vote_program::vote_state::Vote::default())),
                 blockstore: blockstore.clone(),
                 cluster_info: cluster_info.clone(),
                 bank_forks: bank_forks.clone(),
@@ -1394,50 +1398,51 @@ impl Validator {
             };
         }
 
-        let (tpu, mut key_notifies) = Tpu::new(
-            &cluster_info,
-            &poh_recorder,
-            entry_receiver,
-            retransmit_slots_receiver,
-            TpuSockets {
-                transactions: node.sockets.tpu,
-                transaction_forwards: node.sockets.tpu_forwards,
-                vote: node.sockets.tpu_vote,
-                broadcast: node.sockets.broadcast,
-                transactions_quic: node.sockets.tpu_quic,
-                transactions_forwards_quic: node.sockets.tpu_forwards_quic,
-            },
-            &rpc_subscriptions,
-            transaction_status_sender,
-            entry_notification_sender,
-            blockstore.clone(),
-            &config.broadcast_stage_type,
-            exit,
-            node.info.shred_version(),
-            vote_tracker,
-            bank_forks.clone(),
-            verified_vote_sender,
-            gossip_verified_vote_hash_sender,
-            replay_vote_receiver,
-            replay_vote_sender,
-            bank_notification_sender.map(|sender| sender.sender),
-            config.tpu_coalesce,
-            duplicate_confirmed_slot_sender,
-            &connection_cache,
-            turbine_quic_endpoint_sender,
-            &identity_keypair,
-            config.runtime_config.log_messages_bytes_limit,
-            &staked_nodes,
-            config.staked_nodes_overrides.clone(),
-            banking_tracer,
-            tracer_thread,
-            tpu_enable_udp,
-            tpu_max_connections_per_ipaddr_per_minute,
-            &prioritization_fee_cache,
-            config.block_production_method.clone(),
-            config.enable_block_production_forwarding,
-            config.generator_config.clone(),
-        );
+          let tpu = None;
+          let mut key_notifies: Vec<Arc<ConnectionCache>> = Vec::new();
+//            &cluster_info,
+//            &poh_recorder,
+//            entry_receiver,
+//            retransmit_slots_receiver,
+//            TpuSockets {
+//                transactions: node.sockets.tpu,
+//                transaction_forwards: node.sockets.tpu_forwards,
+//                vote: node.sockets.tpu_vote,
+//                broadcast: node.sockets.broadcast,
+//                transactions_quic: node.sockets.tpu_quic,
+//                transactions_forwards_quic: node.sockets.tpu_forwards_quic,
+//          },
+//            &rpc_subscriptions,
+//            transaction_status_sender,
+//            entry_notification_sender,
+//            blockstore.clone(),
+//            &config.broadcast_stage_type,
+//            exit,
+//            node.info.shred_version(),
+//            vote_tracker,
+//            bank_forks.clone(),
+//            verified_vote_sender,
+//            gossip_verified_vote_hash_sender,
+//            replay_vote_receiver,
+//            replay_vote_sender,
+//            bank_notification_sender.map(|sender| sender.sender),
+//            config.tpu_coalesce,
+//            duplicate_confirmed_slot_sender,
+//           &connection_cache,
+//            turbine_quic_endpoint_sender,
+//            &identity_keypair,
+//            config.runtime_config.log_messages_bytes_limit,
+//            &staked_nodes,
+//            config.staked_nodes_overrides.clone(),
+//            banking_tracer,
+//            tracer_thread,
+//            tpu_enable_udp,
+//            tpu_max_connections_per_ipaddr_per_minute,
+//            &prioritization_fee_cache,
+//            config.block_production_method.clone(),
+//            config.enable_block_production_forwarding,
+//            config.generator_config.clone(),
+//        );
 
         datapoint_info!(
             "validator-new",
@@ -1450,23 +1455,36 @@ impl Validator {
         );
 
         *start_progress.write().unwrap() = ValidatorStartProgress::Running;
-        key_notifies.push(connection_cache);
+//       key_notifies.push(connection_cache);
 
         *admin_rpc_service_post_init.write().unwrap() = Some(AdminRpcRequestMetadataPostInit {
             bank_forks: bank_forks.clone(),
             cluster_info: cluster_info.clone(),
             vote_account: *vote_account,
             repair_whitelist: config.repair_whitelist.clone(),
-            notifies: key_notifies,
+            notifies: Vec::new(),
             repair_socket: Arc::new(node.sockets.repair),
             outstanding_repair_requests,
             cluster_slots,
         });
 
+        let snapshot_packager_service = None;
+        let accounts_hash_verifier = None;
+        let entry_notifier_service = None;
+        let geyser_plugin_service = None;
+        let stats_reporter_service = None;
+        let poh_timing_report_service = None;
+        let accounts_background_service = None;
+        let serve_repair_service = None;
+        let poh_service = None;
+        let blockstore_metric_report_service = None;        
+        
         Ok(Self {
             stats_reporter_service,
             gossip_service,
             serve_repair_service,
+            window_service,
+            tower,
             json_rpc_service,
             pubsub_service,
             rpc_completed_slots_service,
@@ -1539,128 +1557,130 @@ impl Validator {
             node.sockets.retransmit_sockets[0].local_addr().unwrap()
         );
     }
-
-    pub fn join(self) {
+pub fn join(self) {
         drop(self.bank_forks);
         drop(self.cluster_info);
 
-        self.poh_service.join().expect("poh_service");
+        if let Some(s) = self.poh_service {
+            s.join().expect("poh_service");
+        }
         drop(self.poh_recorder);
 
-        if let Some(json_rpc_service) = self.json_rpc_service {
-            json_rpc_service.join().expect("rpc_service");
+        if let Some(s) = self.json_rpc_service {
+            s.join().expect("rpc_service");
         }
 
-        if let Some(pubsub_service) = self.pubsub_service {
-            pubsub_service.join().expect("pubsub_service");
+        if let Some(s) = self.pubsub_service {
+            s.join().expect("pubsub_service");
         }
 
-        if let Some(rpc_completed_slots_service) = self.rpc_completed_slots_service {
-            rpc_completed_slots_service
-                .join()
-                .expect("rpc_completed_slots_service");
+        if let Some(s) = self.rpc_completed_slots_service {
+            s.join().expect("rpc_completed_slots_service");
         }
 
-        if let Some(optimistically_confirmed_bank_tracker) =
-            self.optimistically_confirmed_bank_tracker
-        {
-            optimistically_confirmed_bank_tracker
-                .join()
-                .expect("optimistically_confirmed_bank_tracker");
+        if let Some(s) = self.optimistically_confirmed_bank_tracker {
+            s.join().expect("optimistically_confirmed_bank_tracker");
         }
 
-        if let Some(transaction_status_service) = self.transaction_status_service {
-            transaction_status_service
-                .join()
-                .expect("transaction_status_service");
+        if let Some(s) = self.transaction_status_service {
+            s.join().expect("transaction_status_service");
         }
 
-        if let Some(rewards_recorder_service) = self.rewards_recorder_service {
-            rewards_recorder_service
-                .join()
-                .expect("rewards_recorder_service");
+        if let Some(s) = self.rewards_recorder_service {
+            s.join().expect("rewards_recorder_service");
         }
 
-        if let Some(cache_block_meta_service) = self.cache_block_meta_service {
-            cache_block_meta_service
-                .join()
-                .expect("cache_block_meta_service");
+        if let Some(s) = self.cache_block_meta_service {
+            s.join().expect("cache_block_meta_service");
         }
 
-        if let Some(system_monitor_service) = self.system_monitor_service {
-            system_monitor_service
-                .join()
-                .expect("system_monitor_service");
+        if let Some(s) = self.system_monitor_service {
+            s.join().expect("system_monitor_service");
         }
 
-        if let Some(sample_performance_service) = self.sample_performance_service {
-            sample_performance_service
-                .join()
-                .expect("sample_performance_service");
+        if let Some(s) = self.sample_performance_service {
+            s.join().expect("sample_performance_service");
         }
 
-        if let Some(entry_notifier_service) = self.entry_notifier_service {
-            entry_notifier_service
-                .join()
-                .expect("entry_notifier_service");
+        if let Some(s) = self.entry_notifier_service {
+            s.join().expect("entry_notifier_service");
         }
 
         if let Some(s) = self.snapshot_packager_service {
             s.join().expect("snapshot_packager_service");
         }
 
-        self.gossip_service.join().expect("gossip_service");
+        if let Some(s) = self.gossip_service {
+            s.join().expect("gossip_service");
+        }
+
         if let Some(repair_quic_endpoint) = &self.repair_quic_endpoint {
             repair::quic_endpoint::close_quic_endpoint(repair_quic_endpoint);
         }
-        self.serve_repair_service
-            .join()
-            .expect("serve_repair_service");
+
+        if let Some(s) = self.serve_repair_service {
+            s.join().expect("serve_repair_service");
+        }
+
         if let Some(repair_quic_endpoint_join_handle) = self.repair_quic_endpoint_join_handle {
             self.repair_quic_endpoint_runtime
                 .map(|runtime| runtime.block_on(repair_quic_endpoint_join_handle))
                 .transpose()
                 .unwrap();
         };
-        self.stats_reporter_service
-            .join()
-            .expect("stats_reporter_service");
-        self.blockstore_metric_report_service
-            .join()
-            .expect("ledger_metric_report_service");
-        self.accounts_background_service
-            .join()
-            .expect("accounts_background_service");
-        self.accounts_hash_verifier
-            .join()
-            .expect("accounts_hash_verifier");
+
+        if let Some(s) = self.stats_reporter_service {
+            s.join().expect("stats_reporter_service");
+        }
+
+        if let Some(s) = self.blockstore_metric_report_service {
+            s.join().expect("ledger_metric_report_service");
+        }
+
+        if let Some(s) = self.accounts_background_service {
+            s.join().expect("accounts_background_service");
+        }
+
+        if let Some(s) = self.accounts_hash_verifier {
+            s.join().expect("accounts_hash_verifier");
+        }
+
         if let Some(turbine_quic_endpoint) = &self.turbine_quic_endpoint {
             solana_turbine::quic_endpoint::close_quic_endpoint(turbine_quic_endpoint);
         }
-        self.tpu.join().expect("tpu");
+
+        if let Some(s) = self.window_service {
+            s.join().expect("window_service");
+        }
+
+        if let Some(s) = self.tpu {
+            s.join().expect("tpu");
+        }
+
         self.tvu.join().expect("tvu");
+
         if let Some(turbine_quic_endpoint_join_handle) = self.turbine_quic_endpoint_join_handle {
             self.turbine_quic_endpoint_runtime
                 .map(|runtime| runtime.block_on(turbine_quic_endpoint_join_handle))
                 .transpose()
                 .unwrap();
         }
-        if let Some(completed_data_sets_service) = self.completed_data_sets_service {
-            completed_data_sets_service
-                .join()
-                .expect("completed_data_sets_service");
+
+        if let Some(s) = self.completed_data_sets_service {
+            s.join().expect("completed_data_sets_service");
         }
+
         if let Some(ip_echo_server) = self.ip_echo_server {
             ip_echo_server.shutdown_background();
         }
 
-        if let Some(geyser_plugin_service) = self.geyser_plugin_service {
-            geyser_plugin_service.join().expect("geyser_plugin_service");
+        if let Some(s) = self.geyser_plugin_service {
+            s.join().expect("geyser_plugin_service");
         }
 
-        self.poh_timing_report_service
-            .join()
-            .expect("poh_timing_report_service");
+        if let Some(s) = self.poh_timing_report_service {
+            s.join().expect("poh_timing_report_service");
+        }
     }
 }
 
@@ -1716,11 +1736,11 @@ fn maybe_cluster_restart_with_hard_fork(config: &ValidatorConfig, root_slot: Slo
 
 fn post_process_restored_tower(
     restored_tower: crate::consensus::Result<Tower>,
-    validator_identity: &Pubkey,
+    _validator_identity: &Pubkey,
     vote_account: &Pubkey,
     config: &ValidatorConfig,
     bank_forks: &BankForks,
-) -> Result<Tower, String> {
+) -> Result<Option<Tower>, String> {
     let mut should_require_tower = config.require_tower;
 
     let restored_tower = restored_tower.and_then(|tower| {
@@ -1759,7 +1779,7 @@ fn post_process_restored_tower(
     });
 
     let restored_tower = match restored_tower {
-        Ok(tower) => tower,
+        Ok(tower) => Some(tower),
         Err(err) => {
             let voting_has_been_active =
                 active_vote_account_exists_in_bank(&bank_forks.working_bank(), vote_account);
@@ -1788,8 +1808,7 @@ fn post_process_restored_tower(
                     err
                 );
             }
-
-            Tower::new_from_bankforks(bank_forks, validator_identity, vote_account)
+          None
         }
     };
 
@@ -2059,7 +2078,7 @@ impl<'a> ProcessBlockStore<'a> {
                 blockstore_root_scan.join();
             }
 
-            self.tower = Some({
+            self.tower = {
                 let restored_tower = Tower::restore(self.config.tower_storage.as_ref(), self.id);
                 if let Ok(tower) = &restored_tower {
                     // reconciliation attempt 1 of 2 with tower
@@ -2078,7 +2097,7 @@ impl<'a> ProcessBlockStore<'a> {
                     self.config,
                     &self.bank_forks.read().unwrap(),
                 )?
-            });
+            };
 
             if let Some(hard_fork_restart_slot) = maybe_cluster_restart_with_hard_fork(
                 self.config,
