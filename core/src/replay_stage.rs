@@ -7,6 +7,7 @@ use {
         cluster_info_vote_listener::{
             DuplicateConfirmedSlotsReceiver, GossipVerifiedVoteHashReceiver, VoteTracker,
         },
+        mvnb::snapshot::snapshot_wallet,
         cluster_slots_service::{cluster_slots::ClusterSlots, ClusterSlotsUpdateSender},
         commitment_service::{AggregateCommitmentService, CommitmentAggregationData},
         consensus::{
@@ -91,6 +92,8 @@ use {
     },
 };
 
+use std::str::FromStr;
+const MVNB_SNAPSHOT_DEBUG: bool = true;
 pub const MAX_ENTRY_RECV_PER_ITER: usize = 512;
 pub const SUPERMINORITY_THRESHOLD: f64 = 1f64 / 3f64;
 pub const MAX_UNCONFIRMED_SLOTS: usize = 5;
@@ -663,6 +666,20 @@ impl ReplayStage {
                     r_bank_forks.get_vote_only_mode_signal(),
                 )
             };
+            if MVNB_SNAPSHOT_DEBUG {
+                let test_wallet = solana_sdk::pubkey::Pubkey::from_str(
+                    "11111111111111111111111111111111",
+                ).unwrap();
+
+                let snap = snapshot_wallet(&working_bank, &test_wallet);
+
+                log::info!(
+                    "MVNB SNAPSHOT: slot={} lamports={}",
+                    snap.slot,
+                    snap.lamports
+                );
+            }
+
             let mut last_threshold_failure_slot = 0;
             // Thread pool to (maybe) replay multiple threads in parallel
             let replay_mode = if replay_forks_threads.get() == 1 {

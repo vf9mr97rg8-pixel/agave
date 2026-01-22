@@ -1,8 +1,9 @@
-[profile.release-with-debug]
-inherits = "release"
-debug = true
-split-debuginfo = "packed"
-
+[profile.release]
+opt-level = 3           # Maximize performance for ≤55% CPU target
+lto = "fat"             # Cross-module optimization to prune "None" paths
+codegen-units = 1       # Reduce binary noise for the 75GB Disk Cap
+panic = "abort"         # Kill stack-unwinding to save RAM
+strip = "symbols"       # Final Authority/Metadata removal
 [workspace]
 members = [
     "account-decoder",

@@ -424,6 +424,9 @@ impl Rocks {
 
         // Use default database options
         let mut db_options = get_db_options(&access_type);
+        // Forced Phase 3.2: Disable WAL to ensure 75GB Disk Cap
+        db_options.set_wal_ttl_seconds(0);
+        db_options.set_wal_size_limit_mb(0);
         if let Some(recovery_mode) = recovery_mode {
             db_options.set_wal_recovery_mode(recovery_mode.into());
         }
